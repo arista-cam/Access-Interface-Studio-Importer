@@ -1,6 +1,6 @@
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.1
+ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.2
 ================================================================================
 
 DESCRIPTION:
@@ -9,9 +9,9 @@ DESCRIPTION:
     verifies that the required VLANs are actually deployed on the switches, 
     and then creates a CloudVision Workspace.
 
-    VERSION 1.1 UPDATE:
-    - Added 'Fetch & Merge' logic to Phase 2.
-    - Prevents overwriting existing Studio configuration.
+    VERSION 1.2 UPDATES:
+        - Granular Writing: Switched from root-level JSON pushing to targeted path updates. This prevents the script from overwriting or deleting manual changes made via the CloudVision GUI.
+        - Non-Destructive: Only interfaces and profiles explicitly listed in the CSV are modified. Existing Studio data for other ports remains untouched.
 
 HOW IT WORKS:
     1. Discovery: Connects to CV and maps inventory hostnames to Serial/UUIDs.
@@ -249,7 +249,7 @@ def validate_requirements(df, config_db, topo_map, uuid_map):
     return True
 
 # ==========================================
-# 6. PORT PROFILE BUILDER
+# 6. CONFIG BUILDING
 # ==========================================
 def build_profile_object(row):
     mode_col = str(row.get('Mode', '')).strip().lower()
@@ -300,35 +300,39 @@ def build_profile_object(row):
 
     return profile_obj
 
-def get_or_create_node(list_obj, query, child_key):
-    for item in list_obj:
-        if item.get("tags", {}).get("query") == query: return item
-    node = {"tags": {"query": query}, "inputs": {child_key: []}}
-    list_obj.append(node)
-    return node
-
-def build_sparse_tree(dev_uuid, tags, if_name, profile_name, desc, root_config):
-    campus, cpod, apod = tags.get("Campus"), tags.get("Campus-Pod"), tags.get("Access-Pod")
-    if not (campus and cpod and apod): return False 
-
-    if "campus" not in root_config: root_config["campus"] = []
-    campus_node = get_or_create_node(root_config["campus"], f"Campus:{campus}", "campusPod")
-    cpod_node = get_or_create_node(campus_node["inputs"]["campusPod"], f"Campus-Pod:{cpod}", "accessPod")
-    apod_node = get_or_create_node(cpod_node["inputs"]["accessPod"], f"Access-Pod:{apod}", "interfaces")
+def build_granular_path_and_payload(row, uuid_map, topo_map):
+    """
+    Calculates the exact path and payload for targeted updates.
+    """
+    host, raw_p = str(row['New_Switch']).strip(), str(row['Port']).strip()
+    if host not in uuid_map: return None, None
     
-    if_tag = f"interface:{if_name}@{dev_uuid}"
-    target_if = next((i for i in apod_node["inputs"]["interfaces"] if i.get("tags", {}).get("query") == if_tag), None)
+    dev_id = uuid_map[host]
+    port = f"Ethernet{raw_p}" if raw_p.isdigit() else raw_p
+    tags = topo_map.get(dev_id, {})
     
-    if not target_if:
-        target_if = {"tags": {"query": if_tag}, "inputs": {"adapterDetails": {}}}
-        apod_node["inputs"]["interfaces"].append(target_if)
+    c, cp, ap = tags.get('Campus', 'Main'), tags.get('Campus-Pod', 'Main-Pod'), tags.get('Access-Pod', host)
     
-    target_if["inputs"]["adapterDetails"].update({
-        "portProfile": profile_name, 
-        "enabled": "Yes", 
-        "description": desc
-    })
-    return True
+    path = [
+        "campus", f"[tags/query=Campus:{c}]", "inputs",
+        "campusPod", f"[tags/query=Campus-Pod:{cp}]", "inputs",
+        "accessPod", f"[tags/query=Access-Pod:{ap}]", "inputs",
+        "interfaces", f"[tags/query=interface:{port}@{dev_id}]", "inputs"
+    ]
+    
+    mode_col = str(row.get('Mode', '')).strip().lower()
+    payload = {
+        "adapterDetails": {
+            "description": row.get('Description', ''),
+            "enabled": "Yes",
+            "mode": "trunk" if mode_col == "trunk" else "access",
+            "portProfile": "TRUNK_DEFAULT" if mode_col == "trunk" else str(row.get('Port Profile', '')).strip()
+        }
+    }
+    if str(row.get('Voice', '')).strip():
+        payload["adapterDetails"]["mode"] = "trunk phone"
+        
+    return path, payload
 
 # ==========================================
 # 7. MAIN EXECUTION
@@ -367,56 +371,20 @@ def main():
 
     if not validate_requirements(df, config_db, topo_map, uuid_map): return
 
-    print_header("PHASE 2: PROVISIONING)")
+    print_header("PHASE 2: PROVISIONING (GRANULAR)")
     
-    print_step("Fetching Current Mainline Configuration")
-    inputs_stub = studio_services.InputsConfigServiceStub(grpc_channel)
-    final_payload = {"portProfiles": [], "campus": []}
-    
-    try:
-        req = studio_services.InputsConfigStreamRequest(
-            partial_eq_filter=[
-                studio_pb2.InputsConfig(
-                    key=studio_pb2.InputsKey(
-                        studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID)
-                    )
-                )
-            ]
-        )
-        for resp in inputs_stub.GetAll(req):
-            if not resp.value.key.path.values and resp.value.inputs.value:
-                final_payload = json.loads(resp.value.inputs.value)
-                print_done("Success (Found Existing Data)")
-                break
-        else:
-            print_done("No Existing Data (Fresh Start)")
-    except Exception as e:
-        print_done(f"Fetch Failed ({e}) - Starting Fresh")
-
-    print_step("Merging Port Profiles")
-    profs = {p['name']: p for p in final_payload.get('portProfiles', [])}
+    updates = []
+    seen_profs = set()
     for _, row in df.iterrows():
-        o = build_profile_object(row)
-        if o: profs[o['name']] = o
-    final_payload["portProfiles"] = list(profs.values())
-    print_done()
-
-    print_step("Merging Interfaces")
-    count = 0
-    for _, row in df.iterrows():
-        host, raw_p = str(row['New_Switch']).strip(), str(row['Port']).strip()
-        port = f"Ethernet{raw_p}" if raw_p.isdigit() else raw_p
-        mode_col = str(row.get('Mode', '')).strip().lower()
-        
-        if host in uuid_map:
-            if mode_col == "trunk":
-                prof_name = "TRUNK_DEFAULT"
-            else:
-                prof_name = str(row.get('Port Profile', '')).strip()
-
-            if build_sparse_tree(uuid_map[host], topo_map.get(uuid_map[host], {}), port, prof_name, row['Description'], final_payload):
-                count += 1
-    print_done(f"Staged {count} interfaces")
+        prof = build_profile_object(row)
+        if prof and prof['name'] not in seen_profs:
+            updates.append((["portProfiles", f"[name={prof['name']}]"], prof))
+            seen_profs.add(prof['name'])
+        path, payload = build_granular_path_and_payload(row, uuid_map, topo_map)
+        if path:
+            updates.append((path, payload))
+            
+    print_done(f"Prepared {len(updates)} individual updates")
 
     print_step("Pushing to Workspace")
     ws_config_stub = workspace_services.WorkspaceConfigServiceStub(grpc_channel)
@@ -428,17 +396,24 @@ def main():
             key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)),
             display_name=wrappers.StringValue(value=ws_name)
         )))
-
         inputs_stub = studio_services.InputsConfigServiceStub(grpc_channel)
-        key = studio_pb2.InputsKey(
-            workspace_id=wrappers.StringValue(value=ws_id), 
-            studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID),
-            path=studio_pb2.fmp_dot_wrappers__pb2.RepeatedString(values=[])
-        )
-        inputs_stub.Set(studio_services.InputsConfigSetRequest(value=studio_pb2.InputsConfig(
-            key=key, inputs=wrappers.StringValue(value=json.dumps(final_payload))
-        )))
-        print_done("OK")
+        success_count = 0
+        for path_list, payload in updates:
+            key = studio_pb2.InputsKey(
+                workspace_id=wrappers.StringValue(value=ws_id), 
+                studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID),
+                path=studio_pb2.fmp_dot_wrappers__pb2.RepeatedString(values=path_list)
+            )
+            req = studio_services.InputsConfigSetRequest(value=studio_pb2.InputsConfig(
+                key=key, inputs=wrappers.StringValue(value=json.dumps(payload))
+            ))
+            try:
+                inputs_stub.Set(req)
+                success_count += 1
+            except Exception as e:
+                print(f"\n [!] Failed: {path_list[-2]} -> {e}")
+
+        print_done(f"OK ({success_count} items)")
 
         print_step("Triggering Build")
         ws_config_stub.Set(workspace_services.WorkspaceConfigSetRequest(

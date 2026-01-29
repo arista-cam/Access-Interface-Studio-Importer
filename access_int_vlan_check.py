@@ -76,6 +76,7 @@ import pandas as pd
 import os
 import re
 import urllib3
+import time
 from google.protobuf import wrappers_pb2 as wrappers
 from collections import defaultdict
 from cvprac.cvp_client import CvpClient
@@ -398,6 +399,8 @@ def main():
         )))
         inputs_stub = studio_services.InputsConfigServiceStub(grpc_channel)
         success_count = 0
+        fail_count = 0
+
         for path_list, payload in updates:
             key = studio_pb2.InputsKey(
                 workspace_id=wrappers.StringValue(value=ws_id), 
@@ -407,13 +410,21 @@ def main():
             req = studio_services.InputsConfigSetRequest(value=studio_pb2.InputsConfig(
                 key=key, inputs=wrappers.StringValue(value=json.dumps(payload))
             ))
-            try:
-                inputs_stub.Set(req)
-                success_count += 1
-            except Exception as e:
-                print(f"\n [!] Failed: {path_list[-2]} -> {e}")
 
-        print_done(f"OK ({success_count} items)")
+            for attempt in range(3):
+                try:
+                    inputs_stub.Set(req)
+                    success_count += 1
+                    time.sleep(0.1) 
+                    break 
+                except grpc.RpcError as e:
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    print(f"\n [!] Permanent Failure: {path_list[-2]} -> {e.details()}")
+                    fail_count += 1
+
+        print_done(f"OK ({success_count} items pushed, {fail_count} failed)")
 
         print_step("Triggering Build")
         ws_config_stub.Set(workspace_services.WorkspaceConfigSetRequest(

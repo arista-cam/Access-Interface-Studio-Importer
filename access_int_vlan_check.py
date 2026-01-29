@@ -351,7 +351,7 @@ def select_csv_file():
         except ValueError: pass
 
 def main():
-    print_header("ARISTA CLOUDVISION BULK IMPORTER (BULK STREAM)")
+    print_header("ARISTA CLOUDVISION BULK IMPORTER")
     csv_file = select_csv_file()
     df = pd.read_csv(csv_file).fillna("")
     grpc_channel = get_grpc_channel()
@@ -373,57 +373,49 @@ def main():
         if path: updates.append((path, payload))
     print_done(f"Prepared {len(updates)} individual updates")
 
-    print_header("PHASE 3: PUSHING (THROTTLED)")
-    ws_id = str(uuid.uuid4())
-    ws_name = f"Import_{os.path.basename(csv_file)[:10]}_{ws_id[:4]}"
-    
+    print_header("PHASE 3: PUSHING")
+    ws_id = str(uuid.uuid4()); ws_name = f"Import_{os.path.basename(csv_file)[:10]}_{ws_id[:4]}"
     ws_stub = workspace_services.WorkspaceConfigServiceStub(grpc_channel)
     ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
         key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)),
         display_name=wrappers.StringValue(value=ws_name)
     )))
 
-    print_step(f"Pushing {len(updates)} updates")
     inputs_stub = studio_services.InputsConfigServiceStub(grpc_channel)
     
-    success_count = 0
-    fail_count = 0
-
+    config_list = []
     for path_list, payload in updates:
         key = studio_pb2.InputsKey(
             workspace_id=wrappers.StringValue(value=ws_id), 
             studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID),
             path=studio_pb2.fmp_dot_wrappers__pb2.RepeatedString(values=path_list)
         )
-        
-        req = studio_services.InputsConfigSetRequest(value=studio_pb2.InputsConfig(
+        config_list.append(studio_pb2.InputsConfig(
             key=key, 
             inputs=wrappers.StringValue(value=json.dumps(payload))
         ))
-
-        for attempt in range(3):
-            try:
-                inputs_stub.Set(req)
-                success_count += 1
-                time.sleep(0.1) 
-                break
-            except grpc.RpcError as e:
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1)) 
-                    continue
-                print(f"\n [!] Failed: {path_list[-2]} -> {e.details()}")
-                fail_count += 1
-
-    print_done(f"OK ({success_count} pushed, {fail_count} failed)")
+    
+    print_step(f"Sending 1 batch with {len(config_list)} items")
+    
+    try:
+        req = studio_services.InputsConfigSetSomeRequest(values=config_list)
+        responses = inputs_stub.SetSome(req)
+        
+        count = 0
+        for _ in responses:
+            count += 1
+            
+        print_done(f"Success (Batch Accepted)")
+        
+    except grpc.RpcError as e:
+        print_fail(f"SetSome failed: {e.details()}")
+        return
 
     print_step("Triggering Build")
-    ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(
-        value=workspace_pb2.WorkspaceConfig(
-            key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)), 
-            request=1,
-            request_params=workspace_pb2.RequestParams(request_id=wrappers.StringValue(value=str(uuid.uuid4())))
-        )
-    ))
+    ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
+        key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)), request=1,
+        request_params=workspace_pb2.RequestParams(request_id=wrappers.StringValue(value=str(uuid.uuid4())))
+    )))
     print_done("Started")
     print(f"\n REVIEW: https://{CV_ADDR}/cv/provisioning/workspaces?ws={ws_id}\n")
 

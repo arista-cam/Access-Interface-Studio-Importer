@@ -1,6 +1,6 @@
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.0 (WITH VLAN VALIDATION)
+ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.1
 ================================================================================
 
 DESCRIPTION:
@@ -9,12 +9,16 @@ DESCRIPTION:
     verifies that the required VLANs are actually deployed on the switches, 
     and then creates a CloudVision Workspace.
 
+    VERSION 1.1 UPDATE:
+    - Added 'Fetch & Merge' logic to Phase 2.
+    - Prevents overwriting existing Studio configuration.
+
 HOW IT WORKS:
     1. Discovery: Connects to CV and maps inventory hostnames to Serial/UUIDs.
     2. Validation: Scrapes running configs of switches in the CSV to build a 
        real-time VLAN database.
     3. Safety Check: Aborts if a VLAN in the CSV is missing from the switch fabric.
-    4. Provisioning: Builds the Studio payload (Port Profiles + Interface Tree).
+    4. Provisioning: Fetches CURRENT Studio state and merges new ports into it.
     5. Execution: Creates a Workspace and triggers the 'Build' process.
 
 USAGE:
@@ -245,7 +249,7 @@ def validate_requirements(df, config_db, topo_map, uuid_map):
     return True
 
 # ==========================================
-# 6. PORT PROFILE BUILDER (UNFUCKED)
+# 6. PORT PROFILE BUILDER
 # ==========================================
 def build_profile_object(row):
     mode_col = str(row.get('Mode', '')).strip().lower()
@@ -363,16 +367,41 @@ def main():
 
     if not validate_requirements(df, config_db, topo_map, uuid_map): return
 
-    print_header("PHASE 2: PROVISIONING")
-    print_step("Building Payload")
+    print_header("PHASE 2: PROVISIONING)")
+    
+    print_step("Fetching Current Mainline Configuration")
+    inputs_stub = studio_services.InputsConfigServiceStub(grpc_channel)
     final_payload = {"portProfiles": [], "campus": []}
     
-    profs = {}
+    try:
+        req = studio_services.InputsConfigStreamRequest(
+            partial_eq_filter=[
+                studio_pb2.InputsConfig(
+                    key=studio_pb2.InputsKey(
+                        studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID)
+                    )
+                )
+            ]
+        )
+        for resp in inputs_stub.GetAll(req):
+            if not resp.value.key.path.values and resp.value.inputs.value:
+                final_payload = json.loads(resp.value.inputs.value)
+                print_done("Success (Found Existing Data)")
+                break
+        else:
+            print_done("No Existing Data (Fresh Start)")
+    except Exception as e:
+        print_done(f"Fetch Failed ({e}) - Starting Fresh")
+
+    print_step("Merging Port Profiles")
+    profs = {p['name']: p for p in final_payload.get('portProfiles', [])}
     for _, row in df.iterrows():
         o = build_profile_object(row)
         if o: profs[o['name']] = o
     final_payload["portProfiles"] = list(profs.values())
+    print_done()
 
+    print_step("Merging Interfaces")
     count = 0
     for _, row in df.iterrows():
         host, raw_p = str(row['New_Switch']).strip(), str(row['Port']).strip()

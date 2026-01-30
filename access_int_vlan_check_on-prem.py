@@ -1,0 +1,506 @@
+"""
+================================================================================
+ARISTA CLOUDVISION BULK IMPORTER (On-Prem) - VERSION 1.3
+================================================================================
+
+DESCRIPTION:
+    This script automates the provisioning of Campus Access Interfaces via the 
+    'Campus Access Interfaces' Studio. It reads a CSV file of port mappings,
+    verifies that the required VLANs are actually deployed on the switches, 
+    and then creates a CloudVision Workspace.
+
+    VERSION 1.2 UPDATES:
+        - Granular Writing: Switched from root-level JSON pushing to targeted path updates. This prevents the script from overwriting or deleting manual changes made via the CloudVision GUI.
+        - Non-Destructive: Only interfaces and profiles explicitly listed in the CSV are modified. Existing Studio data for other ports remains untouched.
+        - CVP On-Prem uses a different pathing method for Studios, this script is for CVP On-Prem only.
+
+HOW IT WORKS:
+    1. Discovery: Connects to CV and maps inventory hostnames to Serial/UUIDs.
+    2. Validation: Scrapes running configs of switches in the CSV to build a 
+       real-time VLAN database.
+    3. Safety Check: Aborts if a VLAN in the CSV is missing from the switch fabric.
+    4. Provisioning: Fetches CURRENT Studio state and merges new ports into it.
+    5. Execution: Creates a Workspace and triggers the 'Build' process.
+
+USAGE:
+    1. Ensure the 'CSV' folder exists and contains your interface mapping files.
+    2. Ensure that prequisite libraries are installed by running `pip install -r requirements.txt`.
+    3. Update 'CV_ADDR' and 'CV_TOKEN' below.
+    4. Run: python access_int_vlan_check.py
+    5. Select your file from the menu.
+
+CSV STRUCTURE REQUIREMENTS:
+    The CSV must contain the following headers:
+    - New_Switch:   The hostname of the switch (as seen in CloudVision).
+    - Port:         The port number (e.g., 1, 5, 12).
+    - Mode:         'Access' or 'Trunk'.
+    - Port Profile: The name of the profile (e.g., A18, A18-V510, UPLINK).
+    - Access:       The data/native VLAN ID.
+    - Voice:        (Optional) The voice VLAN ID.
+    - Description:  (Optional) Interface description.
+
+MAPPING LOGIC:
+    - If Mode is 'Trunk': Uses generic 'TRUNK_DEFAULT' profile (Allow All).
+    - If Mode is 'Access' and Voice VLAN exists: Uses 'trunk phone' mode.
+    - If Mode is 'Access' and NO Voice VLAN: Uses 'access' mode.
+
+================================================================================
+"""
+import sys
+
+# --- DEPENDENCY CHECK ---
+missing_modules = []
+try: import pandas
+except ImportError: missing_modules.append("pandas")
+try: import cvprac
+except ImportError: missing_modules.append("cvprac")
+try: import arista.workspace.v1
+except ImportError: missing_modules.append("arista-cv-apis")
+
+if missing_modules:
+    print("\n" + "!"*60)
+    print("  MISSING DEPENDENCIES DETECTED")
+    print("!"*60)
+    print(f"  The following Python modules are required but not installed:")
+    for mod in missing_modules:
+        print(f"    - {mod}")
+    print("\n  [ACTION REQUIRED]")
+    print("  Please run the following command to install them:")
+    print("  pip install -r requirements_prod.txt")
+    print("!"*60 + "\n")
+    sys.exit(1)
+
+import grpc
+import uuid
+import json
+import pandas as pd
+import os
+import re
+import urllib3
+import time
+from google.protobuf import wrappers_pb2 as wrappers
+from collections import defaultdict
+from cvprac.cvp_client import CvpClient
+from arista.workspace.v1 import services as workspace_services
+from arista.workspace.v1 import workspace_pb2
+from arista.studio.v1 import services as studio_services
+from arista.studio.v1 import studio_pb2
+from arista.inventory.v1 import services as inventory_services
+from arista.tag.v2 import services as tag_services
+from arista.tag.v2 import tag_pb2
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+CV_TOKEN = "TOKEN"  # Replace with actual service token
+CV_ADDR = "CVP_IP"  # Replace with CloudVision IP or hostname
+CSV_FOLDER_NAME = "CSV"              
+ACCESS_STUDIO_ID = "studio-campus-access-interfaces"
+TARGET_TAG = "Campus" 
+
+# ==========================================
+# 2. UI HELPERS
+# ==========================================
+def print_header(text):
+    print(f"\n{'='*60}")
+    print(f"  {text}")
+    print(f"{'='*60}")
+
+def print_step(text):
+    print(f"  [i] {text}...", end=" ", flush=True)
+
+def print_done(text="Done"):
+    print(f"{text}")
+
+def print_fail(text):
+    print(f"  [!] {text}")
+
+# ==========================================
+# 3. CONNECTION HELPERS
+# ==========================================
+def get_grpc_channel():
+    channel_creds = grpc.ssl_channel_credentials()
+    call_creds = grpc.access_token_call_credentials(CV_TOKEN)
+    conn_creds = grpc.composite_channel_credentials(channel_creds, call_creds)
+    return grpc.secure_channel(CV_ADDR, conn_creds)
+
+def get_cvprac_client():
+    clnt = CvpClient()
+    try:
+        clnt.connect(nodes=[CV_ADDR], username='', password='', api_token=CV_TOKEN, is_cvaas=False)
+        return clnt
+    except Exception as e:
+        print_fail(f"CVPRAC Connection failed: {e}")
+        sys.exit(1)
+
+# ==========================================
+# 4. DISCOVERY & MAPPING
+# ==========================================
+def get_inventory_map(cv_client):
+    print_step("Fetching Inventory (REST)")
+    try:
+        inventory = cv_client.api.get_inventory()
+        inv_map = {d['hostname']: d['systemMacAddress'] for d in inventory if 'systemMacAddress' in d}
+        print_done(f"Done ({len(inv_map)} devices)")
+        return inv_map
+    except Exception:
+        print_done("Failed")
+        return {}
+
+def get_grpc_inventory_map(channel):
+    print_step("Mapping UUIDs (gRPC)")
+    stub = inventory_services.DeviceServiceStub(channel)
+    mapping = {}
+    try:
+        for resp in stub.GetAll(inventory_services.DeviceStreamRequest()):
+            dev = resp.value
+            if dev.hostname.value and dev.key.device_id.value:
+                mapping[dev.hostname.value] = dev.key.device_id.value
+    except grpc.RpcError: pass
+    print_done(f"Done ({len(mapping)} devices)")
+    return mapping
+
+def get_topology_tags(channel):
+    print_step("Mapping Topology Tags")
+    stub = tag_services.TagAssignmentServiceStub(channel)
+    req = tag_services.TagAssignmentStreamRequest(
+        partial_eq_filter=[tag_pb2.TagAssignment(key=tag_pb2.TagAssignmentKey(element_type=tag_pb2.ELEMENT_TYPE_DEVICE))]
+    )
+    topo_map = {} 
+    relevant = {"Campus", "Campus-Pod", "Access-Pod"} 
+    try:
+        for resp in stub.GetAll(req):
+            assign = resp.value
+            d_id = assign.key.device_id.value
+            lbl = assign.key.label.value
+            val = assign.key.value.value
+            if lbl in relevant:
+                if d_id not in topo_map: topo_map[d_id] = {}
+                topo_map[d_id][lbl] = val
+    except grpc.RpcError: pass
+    print_done("Done")
+    return topo_map
+
+def build_switch_config_db(cv_client, target_hostnames, inv_map):
+    print_step(f"Scanning Configs for {len(target_hostnames)} switches")
+    config_db = {}
+    for host in target_hostnames:
+        if host not in inv_map: continue
+        mac = inv_map[host]
+        try:
+            config_text = cv_client.api.get_device_configuration(mac)
+            vlans = set()
+            matches = re.findall(r'^vlan\s+(\d+)', config_text, re.MULTILINE)
+            for m in matches: vlans.add(int(m))
+            config_db[host] = vlans
+        except: pass
+    print_done("Done")
+    return config_db
+
+# ==========================================
+# 5. VALIDATION
+# ==========================================
+def validate_requirements(df, config_db, topo_map, uuid_map):
+    print_step("Validating VLANs against Topology")
+    missing_by_location = defaultdict(set)
+    has_errors = False
+    
+    for _, row in df.iterrows():
+        host = str(row['New_Switch']).strip()
+        mode_col = str(row.get('Mode', '')).strip().lower()
+        
+        if mode_col == "trunk":
+            continue
+
+        required = set()
+        for col in ['Access', 'Voice']:
+            val = str(row.get(col, '')).strip()
+            if val.isdigit(): required.add(int(val))
+        profile = str(row.get('Port Profile', ''))
+        for m in re.findall(r'[AV](\d+)', profile): required.add(int(m))
+        
+        if not required: continue
+        if host not in config_db: continue
+            
+        deployed_vlans = config_db[host]
+        missing = required - deployed_vlans
+        if missing:
+            has_errors = True
+            loc_str = "Unknown Location"
+            if host in uuid_map:
+                dev_id = uuid_map[host]
+                if dev_id in topo_map:
+                    tags = topo_map[dev_id]
+                    c = tags.get('Campus', 'Unknown')
+                    p = tags.get('Campus-Pod', 'Unknown')
+                    loc_str = f"Campus: {c} / Pod: {p}"
+            for v in missing: missing_by_location[loc_str].add(v)
+
+    if has_errors:
+        print_done("FAILED")
+        print("\n" + "!"*60)
+        print("  CRITICAL: MISSING VLANS")
+        print("!"*60)
+        for loc, vls in sorted(missing_by_location.items()):
+            print(f"  LOCATION: {loc}\n  MISSING:  VLANs {', '.join([str(v) for v in sorted(list(vls))])}\n  {'-'*40}")
+        return False
+    print_done("Passed")
+    return True
+
+# ==========================================
+# 6. CONFIG BUILDING
+# ==========================================
+
+def resolve_studio_ids(channel):
+    print_step("Resolving Studio IDs")
+    stub = studio_services.InputsConfigServiceStub(channel)
+    req = studio_services.InputsConfigStreamRequest(
+        partial_eq_filter=[studio_pb2.InputsConfig(key=studio_pb2.InputsKey(studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID)))]
+    )
+
+    studio_map = {}
+
+    try:
+        for resp in stub.GetAll(req):
+            path = resp.value.key.path.values
+            try:
+                data = json.loads(resp.value.inputs.value)
+            except: continue
+
+            if len(path) == 3 and path[0] == "campus" and path[2] == "inputs":
+                key_id = path[1]
+                tag_query = data.get("tags", {}).get("query", "")
+                if tag_query.startswith("Campus:"):
+                    tag_val = tag_query.split(":")[1]
+                    if tag_val not in studio_map: studio_map[tag_val] = {"id": key_id, "pods": {}}
+
+            if len(path) == 6 and path[3] == "campusPod" and path[5] == "inputs":
+                campus_key = path[1]
+                pod_key = path[4]
+                tag_query = data.get("tags", {}).get("query", "")
+                
+                for c_val, c_data in studio_map.items():
+                    if c_data["id"] == campus_key:
+                        if tag_query.startswith("Campus-Pod:"):
+                            pod_val = tag_query.split(":")[1]
+                            if pod_val not in c_data["pods"]: 
+                                c_data["pods"][pod_val] = {"id": pod_key, "access_pods": {}}
+
+            if len(path) == 9 and path[6] == "accessPod" and path[8] == "inputs":
+                campus_key = path[1]
+                pod_key = path[4]
+                acc_key = path[7]
+                tag_query = data.get("tags", {}).get("query", "")
+
+                for c_val, c_data in studio_map.items():
+                    if c_data["id"] == campus_key:
+                        for p_val, p_data in c_data["pods"].items():
+                            if p_data["id"] == pod_key:
+                                if tag_query.startswith("Access-Pod:"):
+                                    acc_val = tag_query.split(":")[1]
+                                    p_data["access_pods"][acc_val] = acc_key
+    except Exception as e:
+        print_fail(f"Resolver failed: {e}")
+        return {}
+    
+    print_done(f"Mapped {len(studio_map)} Campuses")
+    return studio_map
+
+def build_profile_object(row):
+    mode_col = str(row.get('Mode', '')).strip().lower()
+    
+    if mode_col == "trunk":
+        return {
+            "name": "TRUNK_DEFAULT",
+            "mode": "trunk",
+            "enabled": "Yes",
+            "vlans": {},
+            "spanningTree": {"portfast": "edge"}
+        }
+
+    profile_name = str(row.get('Port Profile', '')).strip()
+    if not profile_name or profile_name.lower() == "nan": return None
+
+    voice_vlan_raw = str(row.get('Voice', '')).strip()
+    access_vlan_raw = str(row.get('Access', '')).strip()
+
+    voice_vlan = int(voice_vlan_raw) if voice_vlan_raw.isdigit() else None
+    access_vlan = int(access_vlan_raw) if access_vlan_raw.isdigit() else None
+    
+    if not access_vlan:
+        m = re.search(r'A(\d+)', profile_name)
+        if m: access_vlan = int(m.group(1))
+    if not voice_vlan:
+        m = re.search(r'V(\d+)', profile_name)
+        if m: voice_vlan = int(m.group(1))
+
+    if voice_vlan or "-" in profile_name or "V" in profile_name:
+        mode = "trunk phone"
+    else:
+        mode = "access"
+
+    profile_obj = {
+        "name": profile_name,
+        "mode": mode,
+        "enabled": "Yes", 
+        "vlans": {}, 
+        "spanningTree": {"portfast": "edge"}
+    }
+
+    if mode == "access" and access_vlan:
+        profile_obj["vlans"]["vlans"] = str(access_vlan)
+    elif mode == "trunk phone":
+        if access_vlan: profile_obj["vlans"]["nativeVlan"] = access_vlan
+        if voice_vlan: profile_obj["vlans"]["phoneVlan"] = voice_vlan
+
+    return profile_obj
+
+
+def build_granular_path_and_payload(row, uuid_map, topo_map, studio_map):
+    host, raw_p = str(row['New_Switch']).strip(), str(row['Port']).strip()
+    if host not in uuid_map: return None, None
+    
+    dev_id = uuid_map[host]
+    port = f"Ethernet{raw_p}" if raw_p.isdigit() else raw_p
+    tags = topo_map.get(dev_id, {})
+    
+    c = tags.get('Campus')
+    cp = tags.get('Campus-Pod')
+    ap = tags.get('Access-Pod')
+    
+    if not (c and cp and ap):
+        print(f"  [!] Missing tags for {host}")
+        return None, None
+    
+    try:
+        c_id = studio_map[c]["id"]
+        cp_id = studio_map[c]["pods"][cp]["id"]
+        ap_id = studio_map[c]["pods"][cp]["access_pods"][ap]
+    except KeyError:
+        print(f"  [!] Missing Studio Container for {c}/{cp}/{ap}")
+        return None, None
+    
+    interface_key = str(uuid.uuid4())
+
+    path = [
+        "campus", c_id, "inputs",
+        "campusPod", cp_id, "inputs",
+        "accessPod", ap_id, "inputs",
+        "interfaces", interface_key, "inputs"
+    ]
+    
+    mode_col = str(row.get('Mode', '')).strip().lower()
+    inner_adapter = {
+        "description": row.get('Description', ''),
+        "enabled": "Yes",
+        "mode": "trunk" if mode_col == "trunk" else "access",
+        "portProfile": "TRUNK_DEFAULT" if mode_col == "trunk" else str(row.get('Port Profile', '')).strip()
+    }
+    if str(row.get('Voice', '')).strip():
+        inner_adapter["mode"] = "trunk phone"
+        
+    full_payload = {
+        "inputs": { "adapterDetails": inner_adapter },
+        "tags": { "query": f"interface:{port}@{dev_id}" }
+    }
+        
+    return path, full_payload
+
+# ==========================================
+# 7. MAIN EXECUTION
+# ==========================================
+def select_csv_file():
+    if not os.path.exists(CSV_FOLDER_NAME): return None
+    files = [f for f in os.listdir(CSV_FOLDER_NAME) if f.lower().endswith('.csv')]
+    if not files: return None
+    print("\n--- Available Files ---")
+    for idx, f in enumerate(files): print(f" {idx + 1}. {f}")
+    while True:
+        try:
+            choice = int(input("Select file #: "))
+            if 1 <= choice <= len(files): return os.path.join(CSV_FOLDER_NAME, files[choice - 1])
+        except ValueError: pass
+
+def main():
+    print_header("ARISTA CLOUDVISION BULK IMPORTER")
+    csv_file = select_csv_file()
+    df = pd.read_csv(csv_file).fillna("")
+    grpc_channel = get_grpc_channel()
+    cv_client = get_cvprac_client()
+
+    inv_map = get_inventory_map(cv_client)
+    uuid_map = get_grpc_inventory_map(grpc_channel)
+    topo_map = get_topology_tags(grpc_channel)
+    
+    studio_map = resolve_studio_ids(grpc_channel)
+    if not studio_map:
+        print_fail("Could not resolve Studio IDs. Check your Studio ID.")
+        return
+
+    if not validate_requirements(df, build_switch_config_db(cv_client, set(df['New_Switch'].dropna().unique()), inv_map), topo_map, uuid_map): return
+
+    print_header("PHASE 2: PREPARING UPDATES")
+    updates = []; seen_profs = set()
+    for _, row in df.iterrows():
+        prof = build_profile_object(row)
+        if prof and prof['name'] not in seen_profs:
+            updates.append((["portProfiles", f"[name={prof['name']}]"], prof))
+            seen_profs.add(prof['name'])
+        
+        path, payload = build_granular_path_and_payload(row, uuid_map, topo_map, studio_map)
+        
+        if path: updates.append((path, payload))
+        
+    print_done(f"Prepared {len(updates)} individual updates")
+
+    print_header("PHASE 3: PUSHING")
+    ws_id = str(uuid.uuid4()); ws_name = f"Import_{os.path.basename(csv_file)[:10]}_{ws_id[:4]}"
+    ws_stub = workspace_services.WorkspaceConfigServiceStub(grpc_channel)
+    ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
+        key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)),
+        display_name=wrappers.StringValue(value=ws_name)
+    )))
+
+    inputs_stub = studio_services.InputsConfigServiceStub(grpc_channel)
+    
+    config_list = []
+    for path_list, payload in updates:
+        key = studio_pb2.InputsKey(
+            workspace_id=wrappers.StringValue(value=ws_id), 
+            studio_id=wrappers.StringValue(value=ACCESS_STUDIO_ID),
+            path=studio_pb2.fmp_dot_wrappers__pb2.RepeatedString(values=path_list)
+        )
+        config_list.append(studio_pb2.InputsConfig(
+            key=key, 
+            inputs=wrappers.StringValue(value=json.dumps(payload))
+        ))
+    
+    print_step(f"Sending 1 batch with {len(config_list)} items")
+    
+    try:
+        req = studio_services.InputsConfigSetSomeRequest(values=config_list)
+        responses = inputs_stub.SetSome(req)
+        
+        count = 0
+        for _ in responses:
+            count += 1
+            
+        print_done(f"Success (Batch Accepted)")
+        
+    except grpc.RpcError as e:
+        print_fail(f"SetSome failed: {e.details()}")
+        return
+
+    print_step("Triggering Build")
+    ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
+        key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)), request=1,
+        request_params=workspace_pb2.RequestParams(request_id=wrappers.StringValue(value=str(uuid.uuid4())))
+    )))
+    print_done("Started")
+    print(f"\n REVIEW: https://{CV_ADDR}/cv/provisioning/workspaces?ws={ws_id}\n")
+
+if __name__ == "__main__":
+    main()

@@ -54,7 +54,6 @@ MAPPING LOGIC:
 import sys, os, grpc, uuid, json, re, ssl, urllib3, time
 from collections import defaultdict
 
-# --- DEPENDENCY CHECK ---
 try:
     import pandas as pd
     from cvprac.cvp_client import CvpClient
@@ -73,7 +72,7 @@ except ImportError as e:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# 1. CONFIGURATION
+# CONFIGURATION
 # ==========================================
 CV_TOKEN = "TOKEN"  # Replace with actual service token
 CV_ADDR = "CVP_IP" 
@@ -82,7 +81,7 @@ FABRIC_STUDIO_ID = "studio-avd-campus-fabric"
 CSV_FOLDER_NAME = "CSV"
 
 # ==========================================
-# 2. UI HELPERS
+# UI HELPERS
 # ==========================================
 def print_header(text):
     print(f"\n{'='*80}\n  {text}\n{'='*80}")
@@ -113,7 +112,7 @@ def clean_int_str(val):
     return val
 
 # ==========================================
-# 3. CONNECTIONS
+# CONNECTIONS
 # ==========================================
 def get_grpc_channel():
     cert = ssl.get_server_certificate((CV_ADDR, 443))
@@ -123,7 +122,6 @@ def get_grpc_channel():
 def get_cvp_client():
     clnt = CvpClient()
     try:
-        # Connect using Token (is_cvaas=False for On-Prem)
         clnt.connect(nodes=[CV_ADDR], username='', password='', api_token=CV_TOKEN, is_cvaas=False)
         return clnt
     except Exception as e:
@@ -131,7 +129,7 @@ def get_cvp_client():
         sys.exit(1)
 
 # ==========================================
-# 4. DISCOVERY & MAPPING
+# DISCOVERY & MAPPING
 # ==========================================
 def get_inventory_map(channel):
     stub = inventory_services.DeviceServiceStub(channel)
@@ -169,7 +167,7 @@ def get_topology_tags(channel):
     return topo_map
 
 # ==========================================
-# 5. VLAN VALIDATION ENGINE
+# VLAN VALIDATION
 # ==========================================
 def build_switch_config_db(clnt, target_hostnames, rest_map):
     print_step(f"Scraping VLAN DB from {len(target_hostnames)} switches")
@@ -243,7 +241,7 @@ def validate_requirements(df, config_db, topo_map, uuid_map):
     return True
 
 # ==========================================
-# 6. STRUCTURAL LOGIC
+# STRUCTURAL LOGIC
 # ==========================================
 def build_simple_structure_from_fabric(channel):
     print_step("Reading Fabric Structure")
@@ -322,10 +320,10 @@ def build_pod_location_map(campus_list):
     return loc_map
 
 # ==========================================
-# 7. MAIN EXECUTION
+# MAIN EXECUTION
 # ==========================================
 def main():
-    print_header("ARISTA IMPORTER V71 (SAFE MERGE + VLAN CHECK)")
+    print_header("ARISTA IMPORTER V72 (FIELD-LEVEL MERGE)")
     
     csv_file = select_csv_file()
     if not csv_file: return
@@ -333,9 +331,6 @@ def main():
     grpc_channel = get_grpc_channel()
     rest_client = get_cvp_client()
 
-    # -------------------------------------
-    # PHASE 1: DISCOVERY & VALIDATION
-    # -------------------------------------
     print_header("PHASE 1: DISCOVERY")
     
     uuid_map = get_inventory_map(grpc_channel)
@@ -347,7 +342,6 @@ def main():
     df = pd.read_csv(csv_file).fillna("")
     print_done(f"({len(df)} rows)")
 
-    # VLAN Check
     unique_hosts = set(df['New_Switch'].dropna().unique())
     config_db = build_switch_config_db(rest_client, unique_hosts, rest_map)
     
@@ -355,9 +349,6 @@ def main():
         print_fail("Aborting due to VLAN errors.")
         return
 
-    # -------------------------------------
-    # PHASE 2: PROCESSING
-    # -------------------------------------
     print_header("PHASE 2: PROCESSING")
     
     interface_payloads = defaultdict(list)
@@ -433,10 +424,13 @@ def main():
         working_campus = copy.deepcopy(fabric_struct)
         print_done()
 
-    print_step("Injecting Configs into Tree")
+    print_step("Injecting Configs (Field-Level Merge)")
     loc_map = build_pod_location_map(working_campus)
     
     injected = 0
+    updated = 0
+    added = 0
+    
     for pod_name, new_ifaces in interface_payloads.items():
         if pod_name not in loc_map:
             print(f"\n  [!] Warning: Pod '{pod_name}' found in Tags but missing in Studio Topology")
@@ -446,14 +440,41 @@ def main():
         target_pod = working_campus[c]["inputs"]["campusPod"][cp]["inputs"]["accessPod"][ap]
         
         current_list = target_pod.get("inputs", {}).get("interfaces", [])
-
         if_map = {i["tags"]["query"]: i for i in current_list}
+        
         for ni in new_ifaces:
-            if_map[ni["tags"]["query"]] = ni
+            tag_query = ni["tags"]["query"]
+            
+            if tag_query in if_map:
+                # Interface exists - ONLY update specific fields
+                existing_iface = if_map[tag_query]
+                new_details = ni.get("inputs", {}).get("adapterDetails", {})
+                
+                # Ensure structure exists
+                if "inputs" not in existing_iface:
+                    existing_iface["inputs"] = {}
+                if "adapterDetails" not in existing_iface["inputs"]:
+                    existing_iface["inputs"]["adapterDetails"] = {}
+                
+                # Update ONLY these 3 fields, preserve everything else
+                existing_details = existing_iface["inputs"]["adapterDetails"]
+                if "portProfile" in new_details:
+                    existing_details["portProfile"] = new_details["portProfile"]
+                if "description" in new_details:
+                    existing_details["description"] = new_details["description"]
+                if "enabled" in new_details:
+                    existing_details["enabled"] = new_details["enabled"]
+                
+                updated += 1
+            else:
+                # New interface - add it completely
+                if_map[tag_query] = ni
+                added += 1
             
         target_pod["inputs"]["interfaces"] = list(if_map.values())
         injected += 1
-    print_done(f"({injected} pods updated)")
+        
+    print_done(f"({injected} pods, {updated} updated, {added} added)")
 
     if existing_data:
         ex_profs = {p["name"]: p for p in existing_data.get("portProfiles", [])}
@@ -462,22 +483,49 @@ def main():
     else:
         final_profiles = list(new_profiles.values())
 
-    # -------------------------------------
-    # PHASE 3: EXECUTION
-    # -------------------------------------
     print_header("PHASE 3: PUSH")
     ws_id = str(uuid.uuid4())
     print_step(f"Creating Workspace {ws_id}")
     ws_stub = workspace_services.WorkspaceConfigServiceStub(grpc_channel)
     ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
         key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)),
-        display_name=wrappers.StringValue(value=f"Imp_V71_{ws_id[:4]}")
+        display_name=wrappers.StringValue(value=f"Imp_V72_{ws_id[:4]}")
     )))
     print_done()
 
+    # Filter: Only include pods that have interfaces from CSV
+    print_step("Filtering campus structure")
+    pods_with_csv_data = set(interface_payloads.keys())
+    
+    filtered_campus = []
+    for campus in working_campus:
+        filtered_c = {"tags": campus["tags"], "inputs": {"campusPod": []}}
+        
+        for cpod in campus.get("inputs", {}).get("campusPod", []):
+            filtered_cp = {"tags": cpod["tags"], "inputs": {"accessPod": []}}
+            
+            for apod in cpod.get("inputs", {}).get("accessPod", []):
+                ap_tag = apod.get("tags", {}).get("query", "")
+                if "Access-Pod:" in ap_tag:
+                    pod_name = ap_tag.split("Access-Pod:")[-1].strip()
+                    
+                    # Only include this pod if it has CSV data
+                    if pod_name in pods_with_csv_data:
+                        filtered_cp["inputs"]["accessPod"].append(apod)
+            
+            # Only include campus pod if it has access pods
+            if filtered_cp["inputs"]["accessPod"]:
+                filtered_c["inputs"]["campusPod"].append(filtered_cp)
+        
+        # Only include campus if it has campus pods
+        if filtered_c["inputs"]["campusPod"]:
+            filtered_campus.append(filtered_c)
+    
+    print_done(f"({len(pods_with_csv_data)} pods)")
+
     print_step("Uploading Configuration")
     cfg_stub = studio_services.InputsConfigServiceStub(grpc_channel)
-    final_data = {"campus": working_campus, "portProfiles": final_profiles}
+    final_data = {"campus": filtered_campus, "portProfiles": final_profiles}
     
     cfg_stub.Set(studio_services.InputsConfigSetRequest(value=studio_pb2.InputsConfig(
         key=studio_pb2.InputsKey(
@@ -499,6 +547,8 @@ def main():
 
     print_header("SUCCESS")
     print(f"  Workspace: https://{CV_ADDR}/cv/provisioning/workspaces?ws={ws_id}")
+    print(f"  Updated: {updated} existing interfaces")
+    print(f"  Added: {added} new interfaces")
     print("="*80 + "\n")
 
 if __name__ == "__main__":

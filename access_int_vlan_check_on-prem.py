@@ -66,7 +66,7 @@ try:
     from arista.tag.v2 import services as tag_services
 except ImportError as e:
     print(f"\n[!] Missing Dependency: {e.name}")
-    print("    Run: pip install pandas cvprac arista-cv-apis")
+    print("    Run: pip install -r requirements.txt")
     sys.exit(1)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

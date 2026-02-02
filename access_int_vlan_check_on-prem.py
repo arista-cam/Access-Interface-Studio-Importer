@@ -1,6 +1,6 @@
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERISION 1.3 (MERGE + VLAN CHECK)
+ARISTA CLOUDVISION BULK IMPORTER - VERISION 1.4 (MERGE + VLAN CHECK)
 ================================================================================
 
 DESCRIPTION:
@@ -476,12 +476,20 @@ def main():
         
     print_done(f"({injected} pods, {updated} updated, {added} added)")
 
+    # Only add profiles that don't already exist
+    print_step("Merging port profiles")
     if existing_data:
         ex_profs = {p["name"]: p for p in existing_data.get("portProfiles", [])}
-        ex_profs.update(new_profiles)
+        new_count = 0
+        for pname, pobj in new_profiles.items():
+            if pname not in ex_profs:
+                ex_profs[pname] = pobj
+                new_count += 1
         final_profiles = list(ex_profs.values())
+        print_done(f"({new_count} new, {len(ex_profs)} total)")
     else:
         final_profiles = list(new_profiles.values())
+        print_done(f"({len(final_profiles)} new)")
 
     print_header("PHASE 3: PUSH")
     ws_id = str(uuid.uuid4())

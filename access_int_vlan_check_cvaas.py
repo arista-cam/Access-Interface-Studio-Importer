@@ -135,7 +135,7 @@ def get_grpc_channel():
 def get_cvprac_client():
     clnt = CvpClient()
     try:
-        clnt.connect(nodes=[CV_ADDR], username='', password='', api_token=CV_TOKEN, is_cvaas=False)
+        clnt.connect(nodes=[CV_ADDR], username='', password='', api_token=CV_TOKEN, is_cvaas=True)
         return clnt
     except Exception as e:
         print_fail(f"CVPRAC Connection failed: {e}")

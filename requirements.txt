@@ -3,6 +3,7 @@ git+https://github.com/aristanetworks/cloudvision-python.git
 
 # Arista REST Client (for Config Scraping)
 cvprac
+cloudvision
 
 # Data & Transport
 pandas

@@ -1,31 +1,36 @@
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.2
+ARISTA CLOUDVISION BULK IMPORTER - VERISION 1.3 (SAFE MERGE + VLAN CHECK)
 ================================================================================
 
 DESCRIPTION:
-    This script automates the provisioning of Campus Access Interfaces via the 
-    'Campus Access Interfaces' Studio. It reads a CSV file of port mappings,
-    verifies that the required VLANs are actually deployed on the switches, 
-    and then creates a CloudVision Workspace.
+    This production-ready script automates the provisioning of Campus Access 
+    Interfaces in CloudVision.
 
-    VERSION 1.2 UPDATES:
-        - Granular Writing: Switched from root-level JSON pushing to targeted path updates. This prevents the script from overwriting or deleting manual changes made via the CloudVision GUI.
-        - Non-Destructive: Only interfaces and profiles explicitly listed in the CSV are modified. Existing Studio data for other ports remains untouched.
+    It reads a CSV of port mappings, validates that all required VLANs exist 
+    on the target switches, merges the new configuration with 
+    any existing Studio data, creates a new workspace and builds the changes.
+    Changes need to be reviewed and accepted then pushed via a Change Control
 
 HOW IT WORKS:
-    1. Discovery: Connects to CV and maps inventory hostnames to Serial/UUIDs.
-    2. Validation: Scrapes running configs of switches in the CSV to build a 
-       real-time VLAN database.
-    3. Safety Check: Aborts if a VLAN in the CSV is missing from the switch fabric.
-    4. Provisioning: Fetches CURRENT Studio state and merges new ports into it.
-    5. Execution: Creates a Workspace and triggers the 'Build' process.
+    1. Discovery: Maps device hostnames to UUIDs and learns the full Studio 
+       Topology (scanning both Fabric and Interface studios).
+    2. Validation: Scrapes the running configuration of every target switch 
+       via the CVP API to build a real-time VLAN database. Aborts if missing 
+       VLANs are detected.
+    3. Structure Merge: Downloads the current Interface Studio configuration 
+       and merges it with the Fabric Skeleton to ensure no existing ports 
+       are overwritten (Read-Modify-Write).
+    4. Provisioning: Injects CSV data into the merged tree and auto-generates 
+       smart Port Profiles (Trunk/Phone/Access).
+    5. Execution: Creates a Workspace, pushes the atomic payload, and 
+       triggers the Build.
 
 USAGE:
     1. Ensure the 'CSV' folder exists and contains your interface mapping files.
-    2. Ensure that prequisite libraries are installed by running `pip install -r requirements.txt`.
-    3. Update 'CV_ADDR' and 'CV_TOKEN' below.
-    4. Run: python access_int_vlan_check.py
+    2. Install dependencies: `pip install -r requirements.txt`
+    3. Update 'CV_ADDR' and 'CV_TOKEN' in the Configuration section.
+    4. Run: python access_int_vlan_check_on-prem.py
     5. Select your file from the menu.
 
 CSV STRUCTURE REQUIREMENTS:
@@ -45,6 +50,7 @@ MAPPING LOGIC:
 
 ================================================================================
 """
+
 import sys
 
 # --- DEPENDENCY CHECK ---

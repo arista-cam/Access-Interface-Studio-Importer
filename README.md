@@ -3,12 +3,15 @@
 This project provides a pair of Python automation scripts designed to bulk-provision campus access interfaces in Arista CloudVision using the **Campus Access Interfaces** Studio.
 
 ### The Two Versions:
-1.  **`access_int_vlan_check.py`:**
+1.  **`access_int_vlan_check_cvaas.py`:**
     * Connects to individual switches via REST (cvprac) to verify that all VLANs defined in your CSV actually exist on the devices.
     * Aborts if a missing VLAN is detected to prevent configuration errors.
-2.  **`access_int.py`:**
-    * Skips all VLAN validation and config scraping.
-    * Ideal for lab testing or when you are 100% sure the underlying fabric is ready.
+    * Uses Tag names inside the Studio API calls
+  
+2.  **`access_int_vlan_check_on-prem.py`:**
+    * Connects to individual switches via REST (cvprac) to verify that all VLANs defined in your CSV actually exist on the devices.
+    * Aborts if a missing VLAN is detected to prevent configuration errors.
+    * Uses Index numbers in Studio API calls
 
 ---
 

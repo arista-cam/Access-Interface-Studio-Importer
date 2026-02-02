@@ -446,17 +446,14 @@ def main():
             tag_query = ni["tags"]["query"]
             
             if tag_query in if_map:
-                # Interface exists - ONLY update specific fields
                 existing_iface = if_map[tag_query]
                 new_details = ni.get("inputs", {}).get("adapterDetails", {})
                 
-                # Ensure structure exists
                 if "inputs" not in existing_iface:
                     existing_iface["inputs"] = {}
                 if "adapterDetails" not in existing_iface["inputs"]:
                     existing_iface["inputs"]["adapterDetails"] = {}
                 
-                # Update ONLY these 3 fields, preserve everything else
                 existing_details = existing_iface["inputs"]["adapterDetails"]
                 if "portProfile" in new_details:
                     existing_details["portProfile"] = new_details["portProfile"]
@@ -467,7 +464,6 @@ def main():
                 
                 updated += 1
             else:
-                # New interface - add it completely
                 if_map[tag_query] = ni
                 added += 1
             
@@ -476,7 +472,6 @@ def main():
         
     print_done(f"({injected} pods, {updated} updated, {added} added)")
 
-    # Only add profiles that don't already exist
     print_step("Merging port profiles")
     if existing_data:
         ex_profs = {p["name"]: p for p in existing_data.get("portProfiles", [])}
@@ -501,7 +496,6 @@ def main():
     )))
     print_done()
 
-    # Filter: Only include pods that have interfaces from CSV
     print_step("Filtering campus structure")
     pods_with_csv_data = set(interface_payloads.keys())
     
@@ -517,15 +511,12 @@ def main():
                 if "Access-Pod:" in ap_tag:
                     pod_name = ap_tag.split("Access-Pod:")[-1].strip()
                     
-                    # Only include this pod if it has CSV data
                     if pod_name in pods_with_csv_data:
                         filtered_cp["inputs"]["accessPod"].append(apod)
             
-            # Only include campus pod if it has access pods
             if filtered_cp["inputs"]["accessPod"]:
                 filtered_c["inputs"]["campusPod"].append(filtered_cp)
         
-        # Only include campus if it has campus pods
         if filtered_c["inputs"]["campusPod"]:
             filtered_campus.append(filtered_c)
     

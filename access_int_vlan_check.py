@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 2.0
+ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.3 (ENHANCED - TAG FALLBACK)
 ================================================================================
 
 DESCRIPTION:
@@ -62,9 +63,10 @@ CSV STRUCTURE REQUIREMENTS:
     - Description:  (Optional) Interface description.
 
 MAPPING LOGIC:
-    - If Mode is 'trunk': Uses generic 'TRUNK_DEFAULT' profile (Allow All).
+    - If Mode is 'trunk': skips trunk interface configuration - this should be done manually.
     - If Mode is 'access' and Voice VLAN exists: Uses 'trunk phone' mode.
     - If Mode is 'access' and NO Voice VLAN: Uses 'access' mode.
+
 
 ================================================================================
 """
@@ -109,6 +111,7 @@ def get_grpc_channel():
         creds, grpc.access_token_call_credentials(CV_TOKEN)))
 
 def get_inventory_map(channel):
+    """Returns hostname -> device_id mapping"""
     stub = inventory_services.DeviceServiceStub(channel)
     mapping = {}
     for resp in stub.GetAll(inventory_services.DeviceStreamRequest()):
@@ -117,14 +120,16 @@ def get_inventory_map(channel):
     return mapping
 
 def clean_int_str(s):
+    """Remove .0 from strings like '1674.0'"""
     return s.replace('.0', '') if s else s
 
 def build_profile_object(row):
+    """Build port-profile object from CSV row. Returns None for trunk ports."""
     import re
     
     mode = str(row.get('Mode', '')).strip().lower()
     if mode == "trunk":
-        return {"name": "TRUNK_DEFAULT", "mode": "trunk", "enabled": "Yes", "vlans": {}, "spanningTree": {"portfast": "edge"}}
+        return None
     
     pname = str(row.get('Port Profile', '')).strip()
     if not pname or pname.lower() == "nan": 
@@ -146,6 +151,7 @@ def build_profile_object(row):
     
     p_mode = "trunk phone" if (vv or "V" in pname) else "access"
     p_obj = {
+        "parentProfile": "BASE",
         "name": pname, 
         "mode": p_mode, 
         "enabled": "Yes", 
@@ -164,6 +170,7 @@ def build_profile_object(row):
     return p_obj
 
 def get_device_tags(channel):
+    """Get ALL tags for all devices - returns device_id -> {tag_type: tag_value}"""
     stub = tag_services.TagAssignmentServiceStub(channel)
     device_tags = defaultdict(dict)
     
@@ -176,6 +183,7 @@ def get_device_tags(channel):
     return device_tags
 
 def find_devices_by_hostname(device_tags, hostname):
+    """Find device ID(s) that match a hostname"""
     matches = []
     for device_id, tags in device_tags.items():
         if tags.get('hostname') == hostname:
@@ -183,6 +191,11 @@ def find_devices_by_hostname(device_tags, hostname):
     return matches
 
 def verify_pod_exists_in_tags(channel, pod_name):
+    """
+    NEW FUNCTION: Check if an Access-Pod exists via device tags.
+    Uses GetAll() to query all tag assignments, then filters for the pod.
+    Returns (exists: bool, device_count: int, sample_device_id: str or None)
+    """
     tag_stub = tag_services.TagAssignmentServiceStub(channel)
     
     device_ids = []
@@ -207,6 +220,11 @@ def verify_pod_exists_in_tags(channel, pod_name):
     return exists, len(device_ids), sample
 
 def find_pod_hierarchy_from_device(channel, device_id, existing_data):
+    """
+    NEW FUNCTION: Find where a pod should be created by querying device's Campus/Campus-Pod tags.
+    Uses GetAll() to query all tags for this device.
+    Returns (campus_idx, campusPod_idx, next_accessPod_idx) or None
+    """
     tag_stub = tag_services.TagAssignmentServiceStub(channel)
     
     campus_name = None
@@ -257,6 +275,7 @@ def find_pod_hierarchy_from_device(channel, device_id, existing_data):
     return None
 
 def get_existing_studio_data(channel):
+    """Read latest studio structure to find pod indices"""
     
     stub = studio_services.InputsServiceStub(channel)
     
@@ -278,6 +297,7 @@ def get_existing_studio_data(channel):
     return {}
 
 def get_existing_port_profiles(existing_data):
+    """Extract all existing port-profile names from studio data"""
     existing_profiles = set()
     
     top_level_profiles = existing_data.get("portProfiles", [])
@@ -291,7 +311,7 @@ def get_existing_port_profiles(existing_data):
         for pp in campus.get("inputs", {}).get("portProfiles", []):
             if pp and pp.get("name"):
                 existing_profiles.add(pp["name"])
-
+        
         for cpod in campus.get("inputs", {}).get("campusPod", []):
             for pp in cpod.get("inputs", {}).get("portProfiles", []):
                 if pp and pp.get("name"):
@@ -305,6 +325,7 @@ def get_existing_port_profiles(existing_data):
     return existing_profiles
 
 def create_workspace(channel):
+    """Create and return workspace ID"""
     ws_id = str(uuid.uuid4())
     stub = workspace_services.WorkspaceConfigServiceStub(channel)
     stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
@@ -314,6 +335,7 @@ def create_workspace(channel):
     return ws_id
 
 def get_vlans_from_topology_studio(channel):
+    """Get all VLANs defined in the AVD Campus Topology studio"""
     
     TOPOLOGY_STUDIO_ID = "studio-avd-campus-fabric"
     
@@ -353,10 +375,11 @@ def get_vlans_from_topology_studio(channel):
     return vlans
 
 def validate_vlans_in_topology(csv_data, topology_vlans):
+    """Validate that required VLANs exist in the AVD Campus Topology"""
     import re
     
     print_step("Validating VLANs against topology design")
-
+    
     required_vlans = set()
     
     for row in csv_data:
@@ -368,13 +391,13 @@ def validate_vlans_in_topology(csv_data, topology_vlans):
             val = clean_int_str(str(row.get(col, '')).strip())
             if val and val.isdigit():
                 vlan = int(val)
-                if vlan != 1: 
+                if vlan != 1:
                     required_vlans.add(vlan)
         
         profile = str(row.get('Port Profile', ''))
         for m in re.findall(r'[AV](\d+)', profile):
             vlan = int(m)
-            if vlan != 1: 
+            if vlan != 1:
                 required_vlans.add(vlan)
     
     missing = required_vlans - topology_vlans
@@ -466,12 +489,18 @@ def main():
     
     print_header("PHASE 2: PROCESSING CSV")
     interfaces_by_pod = defaultdict(list)
+    trunk_ports = []
     
     for row in csv_data:
         switch = str(row['New_Switch']).strip()
         port = str(row['Port']).strip()
+        mode = str(row.get('Mode', '')).strip().lower()
         profile = str(row.get('Port Profile', 'TRUNK_DEFAULT')).strip()
         desc = str(row.get('Description', '')).strip()
+        
+        if mode == "trunk":
+            trunk_ports.append(f"{switch} Ethernet{port}")
+            continue
         
         matches = find_devices_by_hostname(device_tags, switch)
         if not matches:
@@ -503,6 +532,7 @@ def main():
     for pod_name, interfaces in interfaces_by_pod.items():
         print(f"    {pod_name}: {len(interfaces)} interfaces")
     
+    
     print_header("PHASE 2.5: VLAN VALIDATION")
     
     print_step("Reading VLANs from topology studio")
@@ -518,7 +548,7 @@ def main():
     print_step("Reading interface studio")
     existing_data = get_existing_studio_data(grpc_channel)
     print_done()
-
+    
     pod_name = list(interfaces_by_pod.keys())[0]
     
     print_step(f"Finding studio pod: Access-Pod:{pod_name}")
@@ -581,7 +611,7 @@ def main():
             "pod_name": pod_name,
             "total_interfaces": 0,
             "tag": f"Access-Pod:{pod_name}",
-            "needs_creation": True 
+            "needs_creation": True
         }]
         
         print(f"\n    ✓ Will create pod at: campus/{c_idx}/campusPod/{cp_idx}/accessPod/{ap_idx}")
@@ -644,7 +674,7 @@ def main():
     print_step("Creating workspace")
     ws_id = create_workspace(grpc_channel)
     print_done(f"({ws_id[:8]})")
-
+    
     print_step("Subscribing to workspace")
     try:
         ws_stub = workspace_services.WorkspaceServiceStub(grpc_channel)
@@ -661,7 +691,7 @@ def main():
     except Exception as e:
         print(f"(warning: {e})")
     print_done()
-
+    
     if needs_creation:
         print_header("PHASE 3.6: CREATE POD STRUCTURE")
         
@@ -673,6 +703,7 @@ def main():
             "tags": {"query": f"Access-Pod:{pod_name}"},
             "inputs": {
                 "interfaces": []
+            }
         }
         
         path_values = [
@@ -726,7 +757,7 @@ def main():
                 print(f"      ... and {len(new_profiles)-5} more")
             
             config_stub = studio_services.InputsConfigServiceStub(grpc_channel)
-            profile_idx = len(existing_profiles) 
+            profile_idx = len(existing_profiles)
             
             for profile_name in sorted(new_profiles):
                 profile_obj = profiles_map[profile_name]
@@ -829,6 +860,18 @@ def main():
     print(f"  Interfaces written: {total_written}")
     print(f"\n  The workspace has been automatically built!")
     print(f"  Open the workspace URL to review and submit changes.")
+    
+    if trunk_ports:
+        print("\n" + "="*80)
+        print(f"  ⚠ TRUNK PORTS SKIPPED ({len(trunk_ports)} total)")
+        print("="*80)
+        print(f"\n  These ports are listed as trunk ports and must be manually configured:")
+        for trunk in trunk_ports[:10]:
+            print(f"    • {trunk}")
+        if len(trunk_ports) > 10:
+            print(f"    ... and {len(trunk_ports)-10} more")
+        print(f"\n  Please manually configure these trunk ports in CloudVision.")
+        print("="*80)
 
 if __name__ == "__main__":
     main()
